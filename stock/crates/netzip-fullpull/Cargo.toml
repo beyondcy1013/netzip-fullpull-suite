@@ -1,0 +1,16 @@
+[package]
+name = "netzip-fullpull"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+dllhqarrow-rs = { path = "../../../crates/rustHq" }
+encoding_rs = "0.8.35"
+flate2 = "1.1.10"
+serde = { version = "1.0.229", features = ["derive"] }
+zstd = "0.13"
+crc32fast = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

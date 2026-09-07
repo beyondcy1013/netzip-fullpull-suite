@@ -1,0 +1,16 @@
+[package]
+name = "dllhqarrow-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dllhqarrow_rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+encoding_rs = "0.8.35"
+flate2 = "1.1.10"
+log = "0.4.34"
+
+[dev-dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
