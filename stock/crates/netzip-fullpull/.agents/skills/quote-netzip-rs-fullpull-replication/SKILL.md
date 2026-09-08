@@ -25,6 +25,10 @@ Published Skill:
   require identical SHA256 values for every mirror before finishing.
 - From that resolved crate, read `docs/STATUS.md`, `PROTOCOL.md`, `EVIDENCE_INDEX.md`,
   `HYPOTHESES.md`, `ACCEPTANCE.md`, and `GITHUB_RELEASE.md` first.
+- When a decoder question needs native instruction-level evidence (bit reader,
+  token semantics, frame loop, 311B commit, EOF clamp), consult the consolidated
+  disassembly reference in the Documentation routing table instead of
+  re-disassembling; verify its pinned binary SHA256 first.
 - Protocol facts, decoder gaps, fixtures, and acceptance state belong there.
 - Product runtime/API/deployment facts remain in the consuming project.
 - Project `progress.MD` files are journals, not protocol authority.
@@ -39,6 +43,7 @@ Write each result to exactly one authoritative destination:
 | Independently confirmed wire, decoder, state, or projection rule | `netzip-fullpull/docs/PROTOCOL.md` |
 | Reusable capture, replay, tooling, account, timing, or diagnosis lesson | `netzip-fullpull/docs/EXPERIENCE.md` |
 | Fixture, pcap, disassembly, report path, scope, and SHA256 | `netzip-fullpull/docs/EVIDENCE_INDEX.md` |
+| Consolidated Wine `网际风.exe` disassembly reference (authoritative binary SHA, function map, 2704 frame loop, bit/token reader, full 27-table token dump + opcode semantics, 311B object layout) | `quoteNetzipRs/docs/forensics/official-5188-wine-disasm-reference-20260908.md`; raw artifacts in `quoteNetzipRs/diagnostics/20260907-disasm-evidence/` and `quoteNetzipRs/diagnostics/20260908-disasm-evidence/` |
 | Open explanation, falsifying test, or rejected hypothesis | `netzip-fullpull/docs/HYPOTHESES.md` |
 | Shared promotion criteria and direct-consumer verification | `netzip-fullpull/docs/ACCEPTANCE.md` |
 | Git repository inventory, commit/push procedure, and remote audit | `netzip-fullpull/docs/GITHUB_RELEASE.md` |

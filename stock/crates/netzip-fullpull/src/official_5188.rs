@@ -2041,12 +2041,8 @@ fn amount_prediction(current: &Official5188InternalRecord, volume_delta: i64) ->
         return None;
     }
     let scale = 10_i128.checked_pow(exponent)?;
-    let last_price = current.last_price_integer();
-    let prediction_price = if last_price != 0 {
-        last_price
-    } else {
-        current.i32_at(0x12b)
-    };
+    // Native 0x44a0ba uses current last, including zero, not metadata reference.
+    let prediction_price = current.last_price_integer();
     // Wine jumps over the volume/price projection when mode is zero.
     let prediction = if mode == 0 {
         0
@@ -2057,18 +2053,7 @@ fn amount_prediction(current: &Official5188InternalRecord, volume_delta: i64) ->
             .checked_div(scale)?;
         i64::try_from(raw).ok()?
     };
-    let adjustment = u32::from_le_bytes(
-        current.bytes[0x123..0x127]
-            .try_into()
-            .expect("fixed amount adjustment"),
-    );
-    if matches!(mode, 0 | 8) && adjustment != 0 {
-        prediction
-            .checked_add(1)?
-            .checked_mul(i64::from(adjustment) + 1)
-    } else {
-        Some(prediction)
-    }
+    Some(prediction)
 }
 
 fn decode_value_accumulators(
@@ -2104,7 +2089,18 @@ fn decode_value_accumulators(
             0x5b25f0
         };
         let token_previous = amount_prediction(current, delta).unwrap_or(0);
-        let delta_amount = value_delta64(reader, table, token_previous)?;
+        let mut delta_amount = value_delta64(reader, table, token_previous)?;
+        let adjustment = u32::from_le_bytes(
+            current.bytes[0x123..0x127]
+                .try_into()
+                .expect("fixed amount adjustment"),
+        );
+        // Native 0x44a119 adjusts the decoded token before adding the baseline.
+        if matches!(current.bytes[0x11f], 0 | 8) && adjustment != 0 {
+            delta_amount = delta_amount
+                .wrapping_add(1)
+                .wrapping_mul(i64::from(adjustment) + 1);
+        }
         let baseline_amount = baseline.map_or(0, |row| row.amount_integer());
         let amount = delta_amount.wrapping_add(baseline_amount);
         // Wine stores the wrapping 64-bit sum without rejecting its signed
@@ -2169,7 +2165,7 @@ fn decode_value_ladder_move(
             return Ok(Official5188LadderMove {
                 code,
                 merge_flag: 0,
-                continue_ladder: true,
+                continue_ladder: false,
             });
         }
         _ => {}
@@ -2221,7 +2217,7 @@ fn decode_value_ladder_move(
     Ok(Official5188LadderMove {
         code,
         merge_flag: 0,
-        continue_ladder: true,
+        continue_ladder: false,
     })
 }
 
@@ -2278,7 +2274,7 @@ fn merge_value_volumes(
     merge_flag: u8,
 ) {
     let Some(row) = baseline else { return };
-    if merge_flag == 2 {
+    if merge_flag & 2 != 0 {
         for slot in 0..10 {
             let offset = 0xa8 + slot * 4;
             current.set_i32(
@@ -2286,20 +2282,28 @@ fn merge_value_volumes(
                 current.i32_at(offset).wrapping_add(row.i32_at(offset)),
             );
         }
-        return;
-    }
-    for slot in 0..10 {
-        let price = current.i32_at(0x58 + slot * 4);
-        if price == 0 {
-            continue;
-        }
-        for old_slot in 0..10 {
-            if price == row.i32_at(0x58 + old_slot * 4) {
-                let value = current
-                    .i32_at(0xa8 + slot * 4)
-                    .wrapping_add(row.i32_at(0xa8 + old_slot * 4));
-                current.set_i32(0xa8 + slot * 4, value);
-                break;
+    } else {
+        // Native searches each five-slot side separately, stopping at the
+        // first old price >= current price, even when that entry cannot merge.
+        for start in [0, 5] {
+            for slot in start..start + 5 {
+                let price = current.i32_at(0x58 + slot * 4);
+                if price == 0 {
+                    continue;
+                }
+                for old_slot in start..start + 5 {
+                    let old_price = row.i32_at(0x58 + old_slot * 4);
+                    if price > old_price {
+                        continue;
+                    }
+                    if price == old_price && current.i32_at(0x58 + old_slot * 4) != 0 {
+                        let value = current
+                            .i32_at(0xa8 + slot * 4)
+                            .wrapping_add(row.i32_at(0xa8 + old_slot * 4));
+                        current.set_i32(0xa8 + slot * 4, value);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -2771,13 +2775,17 @@ fn decode_official_5188_values_partial_impl<R: Official5188BaselineResolver>(
         let mut current = baseline
             .clone()
             .unwrap_or_else(Official5188InternalRecord::zeroed);
-        if let Some(metadata) = stored.as_ref() {
-            current.bytes[0xdf..].copy_from_slice(&metadata.bytes[0xdf..]);
+        // Native 0x449900 copies the entire baseline after the caller's
+        // metadata copy, so relative records retain the baseline tail.
+        if baseline.is_none() {
+            if let Some(metadata) = stored.as_ref() {
+                current.bytes[0xdf..].copy_from_slice(&metadata.bytes[0xdf..]);
+            }
+            current.bytes[0xdf..0xe1].copy_from_slice(&index.symbol_index.to_le_bytes());
+            current.bytes[0xe1..0xe3].copy_from_slice(&index.market);
         }
         current.set_i32(0x00, index.timestamp as i32);
         current.bytes[0xde] = u8::from(index.uses_baseline);
-        current.bytes[0xdf..0xe1].copy_from_slice(&index.symbol_index.to_le_bytes());
-        current.bytes[0xe1..0xe3].copy_from_slice(&index.market);
         if header.clear_ladder {
             current.bytes[0x58..0x80].fill(0);
             current.bytes[0xa8..0xd0].fill(0);
@@ -2879,7 +2887,7 @@ fn decode_official_5188_values_partial_impl<R: Official5188BaselineResolver>(
                 0,
                 value_step!(
                     "timestamp_delta",
-                    value_delta32(&mut reader, 0x5b2a38, index.timestamp as i32, false)
+                    value_delta32(&mut reader, 0x5b2a38, index.timestamp as i32, true)
                 ),
             );
         }
@@ -2973,26 +2981,49 @@ fn decode_official_5188_values_partial_impl<R: Official5188BaselineResolver>(
             ladder_move_code = Some(ladder_move.code);
             ladder_merge_flag = Some(ladder_move.merge_flag);
             ladder_continue = Some(ladder_move.continue_ladder);
-            if ladder_move.continue_ladder {
+            // Native 0x449c14 reads this even when the move skips layout.
+            // Volume decoding at 0x449c62 is independent of that layout flag.
+            let baseline_volume_mask = if baseline.is_some() {
+                value_step!(
+                    "ladder_volume_mask",
+                    value_delta32(&mut reader, 0x5b291c, 0, false)
+                )
+            } else {
+                0
+            };
+            {
                 let ladder_values_start = reader.bit_offset();
-                let ladder = value_step!(
-                    "ladder_values",
-                    decode_value_ladder(
-                        &mut reader,
-                        &mut current,
-                        baseline.as_ref(),
-                        mask_class,
-                        0,
-                        ladder_move.merge_flag,
+                let ladder = if ladder_move.continue_ladder {
+                    value_step!(
+                        "ladder_values",
+                        decode_value_ladder(
+                            &mut reader,
+                            &mut current,
+                            baseline.as_ref(),
+                            mask_class,
+                            baseline_volume_mask,
+                            ladder_move.merge_flag,
+                        )
                     )
-                );
+                } else {
+                    Official5188LadderDecode {
+                        volume_mask: baseline_volume_mask,
+                        flags: ladder_move.merge_flag,
+                        layout: 0,
+                        price_mask: 0,
+                        anchor_value: 0,
+                        anchor_operation: b'E',
+                    }
+                };
                 let ladder_values_end = reader.bit_offset();
-                ladder_values_bits = Some((ladder_values_start, ladder_values_end));
-                ladder_layout = Some(ladder.layout);
-                ladder_flags = Some(ladder.flags);
-                ladder_price_mask = Some(ladder.price_mask);
-                ladder_anchor_value = Some(ladder.anchor_value);
-                ladder_anchor_operation = Some(ladder.anchor_operation);
+                if ladder_move.continue_ladder {
+                    ladder_values_bits = Some((ladder_values_start, ladder_values_end));
+                    ladder_layout = Some(ladder.layout);
+                    ladder_flags = Some(ladder.flags);
+                    ladder_price_mask = Some(ladder.price_mask);
+                    ladder_anchor_value = Some(ladder.anchor_value);
+                    ladder_anchor_operation = Some(ladder.anchor_operation);
+                }
                 ladder_volume_mask = Some(ladder.volume_mask);
                 if ladder.volume_mask != 0 {
                     let table = if baseline.is_some() {
@@ -4978,6 +5009,68 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_delta_matches_native_subtraction_and_absolute_controls() {
+        // Table 0x5b2a38: E=0, B=raw+1, D=absolute. M is not in this table.
+        for (bytes, previous, expected, width) in [
+            (vec![0x80], 100, 99, 6),
+            (vec![0xbc], 100, 84, 6),
+            (vec![0xc0, 0x00], 100, 83, 11),
+            (vec![0x00], 100, 100, 1),
+            (vec![0x80], 0, -1, 6),
+            (vec![0xe0, 0x00, 0x00, 0x0c, 0x80], 100, 100, 35),
+        ] {
+            let mut reader = Official5188BitReader::new(&bytes);
+            assert_eq!(
+                value_delta32(&mut reader, 0x5b2a38, previous, true).unwrap(),
+                expected
+            );
+            assert_eq!(reader.bit_offset(), width);
+        }
+    }
+
+    #[test]
+    fn value_decoder_subtracts_timestamp_delta_without_changing_other_fields() {
+        let original = [
+            0x00, 0xe8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00,
+        ];
+        let index = Official5188DeltaIndexState {
+            market: *b"SH",
+            symbol_index: 24661,
+            timestamp: 1_788_246_001,
+            uses_baseline: false,
+        };
+        let decode = |bytes: &[u8]| {
+            let mut resolver = Official5188MapBaselineResolver::new();
+            decode_official_5188_values(
+                Official5188DeltaStreams {
+                    record_count: 1,
+                    value_stream: bytes,
+                    index_stream: &[],
+                },
+                &[index],
+                &mut resolver,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let baseline = decode(&original);
+        let mut bits: Vec<u8> = original
+            .iter()
+            .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+            .collect();
+        bits[6] = 1; // mask bit 2, followed by header and B(raw=0) delta 1.
+        bits.splice(13..13, [1, 0, 0, 0, 0, 0]);
+        let mut payload = vec![0u8; bits.len().div_ceil(8)];
+        for (offset, bit) in bits.into_iter().enumerate() {
+            payload[offset / 8] |= bit << (7 - offset % 8);
+        }
+        let decoded = decode(&payload);
+        assert_eq!(decoded.record.timestamp(), index.timestamp - 1);
+        assert_eq!(decoded.bit_end, baseline.bit_end + 6);
+        assert_eq!(&decoded.record.bytes[4..], &baseline.record.bytes[4..]);
+    }
+
+    #[test]
     fn value_decoder_returns_mask_18_before_timestamp_delta() {
         let streams = Official5188DeltaStreams {
             record_count: 1,
@@ -5021,6 +5114,87 @@ mod tests {
     }
 
     #[test]
+    fn relative_tail_preserves_baseline_over_distinct_metadata() {
+        let index = Official5188DeltaIndexState {
+            market: *b"SH",
+            symbol_index: 23688,
+            timestamp: 1_788_485_093,
+            uses_baseline: true,
+        };
+        let key = (index.market, index.symbol_index);
+        let mut metadata = Official5188InternalRecord::zeroed();
+        metadata.bytes[0x100] = 0x33;
+        let mut baseline = Official5188InternalRecord::zeroed();
+        baseline.bytes[0x100] = 0x5a;
+        let expected_tail = baseline.bytes[0xdf..].to_vec();
+        let mut resolver = Official5188MapBaselineResolver::new();
+        resolver.records.insert(key, metadata);
+        resolver.baselines.insert(key, baseline);
+        let streams = Official5188DeltaStreams {
+            record_count: 1,
+            // SH600011 conditional native control: mask1, explicit zero core.
+            value_stream: &[0x01, 0xef, 0xfb, 0x70, 0x1e, 0x20, 0x90, 0x01],
+            index_stream: &[],
+        };
+        let decoded = decode_official_5188_values(streams, &[index], &mut resolver).unwrap();
+        assert_eq!(&decoded[0].record.bytes[0xdf..], expected_tail.as_slice());
+        assert_eq!(decoded[0].bit_end, 52);
+        assert_eq!(resolver.baselines[&key].bytes[0x100], 0x5a);
+    }
+
+    #[test]
+    fn absolute_tail_uses_metadata_even_with_distinct_baseline() {
+        let index = Official5188DeltaIndexState {
+            market: *b"SH",
+            symbol_index: 23688,
+            timestamp: 1_788_485_093,
+            uses_baseline: false,
+        };
+        let key = (index.market, index.symbol_index);
+        let mut metadata = Official5188InternalRecord::zeroed();
+        metadata.bytes[0x100] = 0x33;
+        let mut baseline = Official5188InternalRecord::zeroed();
+        baseline.bytes[0x100] = 0x5a;
+        let mut resolver = Official5188MapBaselineResolver::new();
+        resolver.records.insert(key, metadata);
+        resolver.baselines.insert(key, baseline);
+        let streams = Official5188DeltaStreams {
+            record_count: 1,
+            value_stream: &[0x00, 0xe7, 0x00, 0x00],
+            index_stream: &[],
+        };
+        let decoded = decode_official_5188_values(streams, &[index], &mut resolver).unwrap();
+        assert_eq!(decoded[0].record.bytes[0x100], 0x33);
+    }
+
+    #[test]
+    fn missing_baseline_tail_keeps_reject_and_fresh_contracts() {
+        let index = Official5188DeltaIndexState {
+            market: *b"SH",
+            symbol_index: 23688,
+            timestamp: 1_788_485_093,
+            uses_baseline: true,
+        };
+        let key = (index.market, index.symbol_index);
+        let mut metadata = Official5188InternalRecord::zeroed();
+        metadata.bytes[0x100] = 0x33;
+        let mut resolver = Official5188MapBaselineResolver::new();
+        resolver.records.insert(key, metadata);
+        let streams = Official5188DeltaStreams {
+            record_count: 1,
+            value_stream: &[0x01, 0xef, 0xfb, 0x70, 0x1e, 0x20, 0x90, 0x01],
+            index_stream: &[],
+        };
+        let error = decode_official_5188_values(streams, &[index], &mut resolver).unwrap_err();
+        assert!(error.contains("requires missing baseline"), "{error}");
+        assert!(!resolver.baselines.contains_key(&key));
+        let decoded =
+            decode_official_5188_values_with_fresh_fallback(streams, &[index], &mut resolver)
+                .unwrap();
+        assert_eq!(decoded[0].record.bytes[0x100], 0x33);
+    }
+
+    #[test]
     fn amount_prediction_matches_wine_sh603059_fixture() {
         let mut record = Official5188InternalRecord::zeroed();
         record.set_i32(0x10, 2_517);
@@ -5035,18 +5209,42 @@ mod tests {
     }
 
     #[test]
-    fn amount_prediction_uses_reference_price_when_delta_omits_last_price() {
+    fn amount_prediction_preserves_zero_last_price() {
         let mut record = Official5188InternalRecord::zeroed();
         record.bytes[0x11f] = 1;
         record.bytes[0x120] = 2;
         record.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
-        record.set_i32(0x12b, 765);
+        record.set_i32(0x12b, 608);
 
-        assert_eq!(amount_prediction(&record, 6_452), Some(4_935_780));
+        // Frame 258 record 12: native volume 6 -> 26, amount remains 3,648.
+        assert_eq!(amount_prediction(&record, 20), Some(0));
+        assert_eq!(3_648 + amount_prediction(&record, 20).unwrap(), 3_648);
     }
 
     #[test]
-    fn amount_prediction_applies_wine_mode_eight_adjustment() {
+    fn zero_last_amount_accumulator_matches_native_frame258_record12() {
+        // Value-stream bits 912..921: volume, amount24 flag, amount token.
+        let mut reader = Official5188BitReader::new(&[0xc9, 0x20]);
+        let mut baseline = Official5188InternalRecord::zeroed();
+        baseline.set_i64(0x14, 6);
+        baseline.set_i64(0x1c, 3_648);
+        baseline.set_i64(0x24, -6);
+        let mut current = Official5188InternalRecord::zeroed();
+        current.bytes[0x11f] = 1;
+        current.bytes[0x120] = 2;
+        current.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
+        current.set_i32(0x12b, 608);
+        let delta =
+            decode_value_accumulators(&mut reader, &mut current, Some(&baseline), 0, 0x80).unwrap();
+        assert_eq!(delta, 20);
+        assert_eq!(current.volume_integer(), 26);
+        assert_eq!(current.i64_at(0x24), -26);
+        assert_eq!(current.amount_integer(), 3_648);
+        assert_eq!(reader.bit_offset(), 9);
+    }
+
+    #[test]
+    fn amount_prediction_leaves_mode_eight_adjustment_for_decoded_token() {
         let mut record = Official5188InternalRecord::zeroed();
         record.set_i32(0x10, 765);
         record.bytes[0x11f] = 8;
@@ -5054,7 +5252,7 @@ mod tests {
         record.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
         record.bytes[0x123..0x127].copy_from_slice(&2u32.to_le_bytes());
 
-        assert_eq!(amount_prediction(&record, 6_452), Some(14_807_343));
+        assert_eq!(amount_prediction(&record, 6_452), Some(4_935_780));
     }
 
     #[test]
@@ -5066,7 +5264,92 @@ mod tests {
         record.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
         record.bytes[0x123..0x127].copy_from_slice(&2u32.to_le_bytes());
 
-        assert_eq!(amount_prediction(&record, 6_452), Some(3));
+        assert_eq!(amount_prediction(&record, 6_452), Some(0));
+    }
+
+    #[test]
+    fn amount_adjustment_follows_real_nonzero_token() {
+        // Historical frame258 record25 accumulator bits1490..1553; altered
+        // metadata isolates native arithmetic, not live-session quote parity.
+        let tokens = [0xe4, 0x1e, 0x7f, 0x0b, 0x07, 0xad, 0x00, 0x82];
+        for (mode, adjustment, expected) in [
+            (1, 2, -3_784_729_286_159),
+            (8, 0, -3_784_729_286_159),
+            (8, 2, -11_354_187_858_474),
+            (0, 0, -34_751),
+            (0, 2, -104_250),
+        ] {
+            let mut current = Official5188InternalRecord::zeroed();
+            current.set_i32(0x10, 7_266);
+            current.bytes[0x11f] = mode;
+            current.bytes[0x120] = 2;
+            current.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
+            current.bytes[0x123..0x127].copy_from_slice(&(adjustment as u32).to_le_bytes());
+            let mut reader = Official5188BitReader::new(&tokens);
+            decode_value_accumulators(&mut reader, &mut current, None, 0x10, 0xd4).unwrap();
+            assert_eq!(current.volume_integer(), -520_882_088);
+            assert_eq!(
+                current.amount_integer(),
+                expected,
+                "mode={mode}, adjustment={adjustment}"
+            );
+            assert_eq!(reader.bit_offset(), 63);
+        }
+    }
+
+    #[test]
+    fn amount_adjustment_precedes_baseline_addition() {
+        let mut baseline = Official5188InternalRecord::zeroed();
+        baseline.set_i64(0x14, 6);
+        baseline.set_i64(0x1c, 3_648);
+        baseline.set_i64(0x24, -6);
+        let mut current = baseline.clone();
+        current.bytes[0x11f] = 0;
+        current.bytes[0x120] = 2;
+        current.bytes[0x121..0x123].copy_from_slice(&100u16.to_le_bytes());
+        current.bytes[0x123..0x127].copy_from_slice(&2u32.to_le_bytes());
+        let mut reader = Official5188BitReader::new(&[0xc9, 0x20]);
+        decode_value_accumulators(&mut reader, &mut current, Some(&baseline), 0, 0x80).unwrap();
+        assert_eq!(current.amount_integer(), 3_651);
+        assert_eq!(reader.bit_offset(), 9);
+    }
+
+    #[test]
+    fn volume_merge_matches_native_frame258_record30() {
+        let mut current = Official5188InternalRecord::zeroed();
+        let mut baseline = Official5188InternalRecord::zeroed();
+        let current_volumes = [0, 927, -119, -28, 353, 54, 5, 0, 0, 2456];
+        let baseline_volumes = [
+            8_786_262, 21_360, 7, 7882, 88, 105, 4_444_761, 2_605_804, 119_595, 8,
+        ];
+        for slot in 0..10 {
+            current.set_i32(0x58 + slot * 4, slot as i32 - 3);
+            baseline.set_i32(0x58 + slot * 4, slot as i32 - 4);
+            current.set_i32(0xa8 + slot * 4, current_volumes[slot]);
+            baseline.set_i32(0xa8 + slot * 4, baseline_volumes[slot]);
+        }
+        current.set_i32(0x10, 1);
+        merge_value_volumes(&mut current, Some(&baseline), 266, 0);
+        let expected = [
+            21_360, 934, -119, -28, 87, 4_444_815, 2_605_809, 119_595, 8, 2456,
+        ];
+        for (slot, expected) in expected.into_iter().enumerate() {
+            assert_eq!(current.i32_at(0xa8 + slot * 4), expected, "slot={slot}");
+        }
+    }
+
+    #[test]
+    fn volume_merge_slot_flag_still_subtracts_trade_delta() {
+        for flags in [2, 3] {
+            let mut current = Official5188InternalRecord::zeroed();
+            let mut baseline = Official5188InternalRecord::zeroed();
+            current.set_i32(0x10, 10);
+            current.set_i32(0x68, 10);
+            current.set_i32(0xb8, 100);
+            baseline.set_i32(0xb8, 20);
+            merge_value_volumes(&mut current, Some(&baseline), 7, flags);
+            assert_eq!(current.i32_at(0xb8), 113);
+        }
     }
 
     #[test]
@@ -5177,7 +5460,7 @@ mod tests {
             Official5188LadderMove {
                 code: 144,
                 merge_flag: 0,
-                continue_ladder: true,
+                continue_ladder: false,
             }
         );
         assert_eq!(current.i32_at(0x58), 11);
@@ -5186,7 +5469,49 @@ mod tests {
     }
 
     #[test]
-    fn ladder_move_code_minus_one_restores_and_continues() {
+    fn baseline_move_minus_one_reads_volumes_without_layout() {
+        // Frame 258 record 0: pinned native execution ends at bit 108.
+        // Scalar input state is synthetic; all token boundaries are wire-driven.
+        let streams = Official5188DeltaStreams {
+            record_count: 1,
+            value_stream: &[
+                0xc1, 0x39, 0x2f, 0xd9, 0xa1, 0x21, 0xf0, 0x73, 0x04, 0xb4, 0x0b, 0x06, 0xde, 0x20,
+            ],
+            index_stream: &[],
+        };
+        let indexes = [Official5188DeltaIndexState {
+            market: *b"SZ",
+            symbol_index: 231,
+            timestamp: 1,
+            uses_baseline: true,
+        }];
+        let mut prior = Official5188InternalRecord::zeroed();
+        prior.set_i32(0x10, 8);
+        let mut resolver = Official5188MapBaselineResolver::new();
+        resolver.insert(*b"SZ", 231, prior);
+        let decoded =
+            decode_official_5188_values_partial_with_trace(streams, &indexes, &mut resolver);
+        assert!(
+            decoded.outcome.error.is_none(),
+            "{:?}",
+            decoded.outcome.error
+        );
+        assert_eq!(decoded.outcome.records.len(), 1);
+        let trace = &decoded.traces[0];
+        assert_eq!(trace.prefix_values_end, 43);
+        assert_eq!(trace.ladder_move_bits, Some((43, 44)));
+        assert_eq!(trace.ladder_move_code, Some(-1));
+        assert_eq!(trace.ladder_continue, Some(false));
+        assert_eq!(trace.ladder_layout, None);
+        assert_eq!(trace.ladder_values_bits, None);
+        assert_eq!(trace.ladder_volume_mask, Some(248));
+        assert_eq!(trace.ladder_volumes_end, Some(102));
+        assert_eq!(trace.trailing_da_end, Some(108));
+        assert_eq!(trace.aligned_end, 112);
+    }
+
+    #[test]
+    fn ladder_move_code_minus_one_restores_without_layout() {
         let mut baseline = Official5188InternalRecord::zeroed();
         for slot in 0..10 {
             baseline.set_i32(0x58 + slot * 4, 100 + slot as i32);
@@ -5201,7 +5526,7 @@ mod tests {
             Official5188LadderMove {
                 code: -1,
                 merge_flag: 0,
-                continue_ladder: true,
+                continue_ladder: false,
             }
         );
         assert_eq!(current.i32_at(0x58), 100);
